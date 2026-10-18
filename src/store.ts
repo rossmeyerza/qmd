@@ -65,11 +65,12 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
-import type {
-  NamedCollection,
-  Collection,
-  CollectionConfig,
-  ContextMap,
+import {
+  normalizeEmbedRules,
+  type NamedCollection,
+  type Collection,
+  type CollectionConfig,
+  type ContextMap,
 } from "./collections.js";
 import { METADATA_EXTRACTION_VERSION, type DocumentMetadata } from "./metadata.js";
 import { compileMetadataFilter, type MetadataFilter } from "./metadata-filter.js";
@@ -1327,7 +1328,6 @@ function initializeDatabase(db: Database): void {
       embed_max_bytes INTEGER
     )
   `);
-  ensureStoreCollectionsEmbedColumns(db);
 
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
@@ -1336,6 +1336,7 @@ function initializeDatabase(db: Database): void {
       value TEXT
     )
   `);
+  ensureStoreCollectionsEmbedColumns(db);
 
   // File sync state — mtime+size fast-path.
   // Inspired by qmd-py incremental sync.
@@ -1389,19 +1390,28 @@ const STORE_COLLECTION_EMBED_COLUMNS = [
 /**
  * Stores created before the embed rules have no embed_* columns. Add them in
  * place; CREATE TABLE IF NOT EXISTS leaves an existing table unchanged.
+ *
+ * An older qmd may have synced a config that already had embed rules, and
+ * stored its hash without the columns to hold them. Clear the hash when a
+ * column is added so the next sync writes the rules.
  */
 function ensureStoreCollectionsEmbedColumns(db: Database): void {
   const cols = db.prepare(`PRAGMA table_info(store_collections)`).all() as { name?: string }[];
   const present = new Set(cols.map(col => col.name));
+  let added = false;
   for (const column of STORE_COLLECTION_EMBED_COLUMNS) {
     if (present.has(column.name)) continue;
     try {
       db.exec(`ALTER TABLE store_collections ADD COLUMN ${column.name} ${column.definition}`);
+      added = true;
     } catch (error) {
       // Another process may have added the column between the probe and the ALTER.
       const message = error instanceof Error ? error.message : String(error);
       if (!message.includes("duplicate column name")) throw error;
     }
+  }
+  if (added) {
+    db.prepare(`DELETE FROM store_config WHERE key = 'config_hash'`).run();
   }
 }
 
@@ -1417,11 +1427,6 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
   };
-}
-
-function validateEmbedMaxBytes(collectionName: string, value: number | undefined): number | null {
-  if (value === undefined || value === null) return null;
-  return validatePositiveIntegerOption(`collections.${collectionName}.embedMaxBytes`, value, 0);
 }
 
 export function getStoreCollections(db: Database): NamedCollection[] {
@@ -1464,6 +1469,7 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
   ensureStoreCollectionsEmbedColumns(db);
+  const embedRules = normalizeEmbedRules(name, collection);
   db.prepare(`
     INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context, embed_ignore_patterns, embed_max_bytes)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1484,8 +1490,8 @@ export function upsertStoreCollection(db: Database, name: string, collection: Om
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
     collection.context ? JSON.stringify(collection.context) : null,
-    collection.embedIgnore?.length ? JSON.stringify(collection.embedIgnore) : null,
-    validateEmbedMaxBytes(name, collection.embedMaxBytes),
+    embedRules.embedIgnore ? JSON.stringify(embedRules.embedIgnore) : null,
+    embedRules.embedMaxBytes,
   );
 }
 
@@ -1555,6 +1561,9 @@ export function syncConfigToDb(db: Database, config: CollectionConfig): void {
   const configNames = new Set(Object.keys(config.collections));
 
   for (const [name, coll] of Object.entries(config.collections)) {
+    for (const problem of normalizeEmbedRules(name, coll).problems) {
+      console.warn(`Warning: ${problem}`);
+    }
     upsertStoreCollection(db, name, coll);
   }
 
@@ -2305,14 +2314,6 @@ function getEmbedSkipRules(db: Database): Map<string, EmbedSkipRule> | null {
   return rules.size > 0 ? rules : null;
 }
 
-function isEmbeddable(rules: Map<string, EmbedSkipRule>, collection: string, path: string, bytes: number): boolean {
-  const rule = rules.get(collection);
-  if (!rule) return true;
-  if (rule.maxBytes !== null && bytes > rule.maxBytes) return false;
-  if (rule.isIgnored && rule.isIgnored(path)) return false;
-  return true;
-}
-
 type PendingEmbeddingDocRow = PendingEmbeddingDoc & { collection: string };
 
 const octetLengthSupport = new WeakMap<Database, boolean>();
@@ -2338,24 +2339,36 @@ function contentBytesExpr(db: Database): string {
 }
 
 /**
- * One row per active document (not per hash) so each path can be checked
- * against its collection's embed rules. A hash is pending when at least one
- * of its documents may be embedded; identical content elsewhere still needs
- * the vectors.
+ * Pending documents that the embed rules allow, one entry per hash. A hash is
+ * pending when at least one of its documents may be embedded; identical
+ * content elsewhere still needs the vectors.
+ *
+ * SQL applies embedMaxBytes, so oversized documents never reach JavaScript.
+ * Only documents in a collection with embedIgnore come back one row per
+ * document for the glob check. When `withBytes` is false (status counts),
+ * content is read only for collections with embedMaxBytes.
  */
-function getPendingEmbeddingDocsWithRules(
+function getEmbeddablePendingDocs(
   db: Database,
   rules: Map<string, EmbedSkipRule>,
   collection: string | undefined,
   model: string,
+  withBytes: boolean,
 ): PendingEmbeddingDoc[] {
+  const ruleRows = [...rules].map(([name, rule]) => [name, rule.maxBytes] as const);
+  const ruleValues = ruleRows.map(() => `(?, ?)`).join(", ");
+  const bytesExpr = contentBytesExpr(db);
+  const sizeCheck = `CASE WHEN r.max_bytes IS NULL THEN 1
+             ELSE (SELECT ${bytesExpr} FROM content c WHERE c.hash = d.hash) <= r.max_bytes END`;
+  const bytesColumn = withBytes ? `(SELECT ${bytesExpr} FROM content c WHERE c.hash = d.hash)` : `0`;
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
     const stmt = db.prepare(`
-      SELECT d.hash, d.collection, d.path, ${contentBytesExpr(db)} as bytes
+      WITH embed_rules(collection, max_bytes) AS (VALUES ${ruleValues})
+      SELECT d.hash, d.collection, d.path, ${bytesColumn} as bytes
       FROM documents d
-      JOIN content c ON d.hash = c.hash
+      LEFT JOIN embed_rules r ON r.collection = d.collection
       LEFT JOIN (
         SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
         FROM content_vectors
@@ -2364,14 +2377,15 @@ function getPendingEmbeddingDocsWithRules(
       ) v ON d.hash = v.hash
       WHERE d.active = 1
         AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        AND ${sizeCheck}
         ${collectionFilter}
     `);
+    const params: SQLiteValue[] = [...ruleRows.flat(), model, fingerprint];
+    if (collection) params.push(collection);
     const byHash = new Map<string, PendingEmbeddingDoc & { embeddable: boolean }>();
-    const iter = collection
-      ? stmt.iterate(model, fingerprint, collection)
-      : stmt.iterate(model, fingerprint);
-    for (const row of iter as IterableIterator<PendingEmbeddingDocRow>) {
-      const embeddable = isEmbeddable(rules, row.collection, row.path, row.bytes);
+    for (const row of stmt.iterate(...params) as IterableIterator<PendingEmbeddingDocRow>) {
+      const isIgnored = rules.get(row.collection)?.isIgnored;
+      const embeddable = !isIgnored || !isIgnored(row.path);
       const seen = byHash.get(row.hash);
       if (!seen) {
         byHash.set(row.hash, { hash: row.hash, path: row.path, bytes: row.bytes, embeddable });
@@ -2380,16 +2394,17 @@ function getPendingEmbeddingDocsWithRules(
       if (row.path < seen.path) seen.path = row.path;
       seen.embeddable ||= embeddable;
     }
-    return [...byHash.values()]
-      .filter(doc => doc.embeddable)
-      .map(({ hash, path, bytes }) => ({ hash, path, bytes }))
-      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    const docs: PendingEmbeddingDoc[] = [];
+    for (const { hash, path, bytes, embeddable } of byHash.values()) {
+      if (embeddable) docs.push({ hash, path, bytes });
+    }
+    return docs.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   });
 }
 
 function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
   const rules = getEmbedSkipRules(db);
-  if (rules) return getPendingEmbeddingDocsWithRules(db, rules, collection, model);
+  if (rules) return getEmbeddablePendingDocs(db, rules, collection, model, true);
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
@@ -3104,7 +3119,7 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
   const rules = getEmbedSkipRules(db);
-  if (rules) return getPendingEmbeddingDocsWithRules(db, rules, collection, model).length;
+  if (rules) return getEmbeddablePendingDocs(db, rules, collection, model, false).length;
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {

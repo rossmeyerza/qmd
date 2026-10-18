@@ -52,6 +52,8 @@ import {
   normalizeDocid,
   isDocid,
   syncConfigToDb,
+  getStoreCollections,
+  getHashesNeedingEmbedding,
   reindexCollection,
   resolveVirtualPath,
   STRONG_SIGNAL_MIN_SCORE,
@@ -3931,9 +3933,60 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
-  test("embedMaxBytes must be a positive integer", async () => {
+  test("invalid embed rules warn and do not stop the config sync", async () => {
     const store = await createTestStore();
-    await expect(createTestCollection({ embedMaxBytes: 0 })).rejects.toThrow(/embedMaxBytes must be a positive integer/);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      syncConfigToDb(store.db, {
+        collections: {
+          a: { path: "/test/a", pattern: "**/*.md" },
+          b: { path: "/test/b", pattern: "**/*.md", embedMaxBytes: "1MB" as any, embedIgnore: "**/*.csv.md" as any },
+          c: { path: "/test/c", pattern: "**/*.md", embedMaxBytes: 0 },
+        },
+      });
+
+      const synced = getStoreCollections(store.db);
+      expect(synced.map(coll => coll.name).sort()).toEqual(["a", "b", "c"]);
+      expect(synced.some(coll => coll.embedIgnore || coll.embedMaxBytes)).toBe(false);
+      const warnings = warn.mock.calls.map(call => String(call[0]));
+      expect(warnings.some(w => w.includes("collections.b.embedMaxBytes"))).toBe(true);
+      expect(warnings.some(w => w.includes("collections.b.embedIgnore"))).toBe(true);
+      expect(warnings.some(w => w.includes("collections.c.embedMaxBytes"))).toBe(true);
+      expect(store.db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get()).toBeTruthy();
+    } finally {
+      warn.mockRestore();
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("collection-scoped pending counts apply embed rules", async () => {
+    const store = await createTestStore();
+    const skipping = await createTestCollection({ pwd: "/test/skipping", embedIgnore: ["**/*.csv.md"] });
+    const plain = await createTestCollection({ pwd: "/test/plain" });
+
+    await insertTestDocument(store.db, skipping, { displayPath: "rows.csv.md", body: "# Rows\n\na,b" });
+    await insertTestDocument(store.db, skipping, { displayPath: "notes.md", body: "# Notes\n\nKeep." });
+    await insertTestDocument(store.db, plain, { displayPath: "rows.csv.md", body: "# Other rows\n\nc,d" });
+
+    expect(getHashesNeedingEmbedding(store.db, skipping)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db, plain)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db)).toBe(2);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embedMaxBytes works without octet_length()", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({ embedMaxBytes: 64 });
+    await insertTestDocument(store.db, collectionName, { displayPath: "small.md", body: "# Small\n\nShort." });
+    await insertTestDocument(store.db, collectionName, { displayPath: "big.md", body: `# Big\n\n${"word ".repeat(40)}` });
+
+    // SQLite before 3.43 has no octet_length(); the probe fails and the
+    // length(CAST(... AS BLOB)) fallback must give the same answer.
+    const oldSqlite = failingDb(store.db, "octet_length", "no such function: octet_length");
+    expect(getHashesNeedingEmbedding(oldSqlite)).toBe(1);
+    expect(getHashesNeedingEmbedding(store.db)).toBe(1);
+
     await cleanupTestDb(store);
   });
 
@@ -3942,6 +3995,8 @@ describe("Index Status", () => {
     const dbPath = testDbPath;
     store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_ignore_patterns`);
     store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_max_bytes`);
+    // An older qmd stored the hash of a config whose embed rules it could not save.
+    store.db.prepare(`INSERT OR REPLACE INTO store_config (key, value) VALUES ('config_hash', 'from-older-qmd')`).run();
     store.close();
 
     const reopened = createStore(dbPath);
@@ -3949,6 +4004,7 @@ describe("Index Status", () => {
     const cols = (reopened.db.prepare(`PRAGMA table_info(store_collections)`).all() as { name: string }[]).map(c => c.name);
     expect(cols).toContain("embed_ignore_patterns");
     expect(cols).toContain("embed_max_bytes");
+    expect(reopened.db.prepare(`SELECT value FROM store_config WHERE key = 'config_hash'`).get()).toBeFalsy();
 
     const collectionName = await createTestCollection({ embedIgnore: ["skip/**"] });
     await insertTestDocument(reopened.db, collectionName, { displayPath: "skip/a.md", body: "# A\n\nSkipped." });

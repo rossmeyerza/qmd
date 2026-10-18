@@ -134,6 +134,7 @@ import {
   getLocalDbPath,
   getConfigPath,
   configExists,
+  normalizeEmbedRules,
   type CollectionConfig,
   type ModelsConfig,
 } from "../collections.js";
@@ -1838,9 +1839,10 @@ function collectionList(): void {
     if (yamlColl?.ignore?.length) {
       console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
     }
+    const embedRules = yamlColl ? normalizeEmbedRules(coll.name, yamlColl) : null;
     const embedSkips = [
-      ...(yamlColl?.embedIgnore ?? []),
-      ...(yamlColl?.embedMaxBytes != null ? [`> ${formatBytes(yamlColl.embedMaxBytes)}`] : []),
+      ...(embedRules?.embedIgnore ?? []),
+      ...(embedRules?.embedMaxBytes != null ? [`> ${formatBytes(embedRules.embedMaxBytes)}`] : []),
     ];
     if (embedSkips.length) {
       console.log(`  ${c.dim}No embed:${c.reset} ${embedSkips.join(', ')}`);

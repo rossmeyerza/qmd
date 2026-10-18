@@ -797,7 +797,10 @@ collections:
 > but does not re-index on its own. Run `qmd update` after changing `path`,
 > `pattern`, or `ignore`, and `qmd embed` after changing `models.embed`.
 > A change to `embedIgnore` or `embedMaxBytes` applies to the next `qmd embed`.
-> It does not delete vectors that already exist.
+> It does not delete vectors that already exist. The rules match the path that
+> `qmd ls` shows. A skipped document can still appear in vector search when
+> another document has the same content and gets embedded, because both
+> documents share the vectors.
 
 #### Automatic update commands
 
