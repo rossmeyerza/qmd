@@ -239,7 +239,7 @@ async function syncTestConfig(): Promise<void> {
 
 // Helper to create a test collection in YAML config
 async function createTestCollection(
-  options: { pwd?: string; glob?: string; name?: string; ignore?: string[] } = {}
+  options: { pwd?: string; glob?: string; name?: string; ignore?: string[]; embedIgnore?: string[]; embedMaxBytes?: number } = {}
 ): Promise<string> {
   const pwd = options.pwd || "/test/collection";
   const glob = options.glob || "**/*.md";
@@ -256,6 +256,8 @@ async function createTestCollection(
     path: pwd,
     pattern: glob,
     ...(options.ignore ? { ignore: options.ignore } : {}),
+    ...(options.embedIgnore ? { embedIgnore: options.embedIgnore } : {}),
+    ...(options.embedMaxBytes !== undefined ? { embedMaxBytes: options.embedMaxBytes } : {}),
   };
 
   // Write back
@@ -3894,6 +3896,67 @@ describe("Index Status", () => {
     await cleanupTestDb(store);
   });
 
+  test("getHashesNeedingEmbedding skips documents matched by embed rules", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection({
+      embedIgnore: ["**/*.csv.md"],
+      embedMaxBytes: 64,
+    });
+
+    await insertTestDocument(store.db, collectionName, { displayPath: "notes/plan.md", body: "# Plan\n\nShort note." });
+    await insertTestDocument(store.db, collectionName, { displayPath: "data/export.csv.md", body: "# Export\n\na,b,c" });
+    await insertTestDocument(store.db, collectionName, { displayPath: "data/big.xlsx.md", body: `# Big\n\n${"cell ".repeat(40)}` });
+
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+    expect(store.getStatus().needsEmbedding).toBe(1);
+    // Skipped documents stay in the BM25 index
+    expect(store.searchFTS("Export", 10).map(r => r.displayPath)).toContain(`${collectionName}/data/export.csv.md`);
+    expect(store.searchFTS("cell", 10).map(r => r.displayPath)).toContain(`${collectionName}/data/big.xlsx.md`);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embed rules keep content pending while any document may embed it", async () => {
+    const store = await createTestStore();
+    const skipping = await createTestCollection({ pwd: "/test/skipping", embedIgnore: ["**"] });
+    const embedding = await createTestCollection({ pwd: "/test/embedding" });
+    const body = "# Shared\n\nSame content in two collections.";
+
+    await insertTestDocument(store.db, skipping, { displayPath: "a.md", body });
+    expect(store.getHashesNeedingEmbedding()).toBe(0);
+
+    await insertTestDocument(store.db, embedding, { displayPath: "b.md", body });
+    expect(store.getHashesNeedingEmbedding()).toBe(1);
+
+    await cleanupTestDb(store);
+  });
+
+  test("embedMaxBytes must be a positive integer", async () => {
+    const store = await createTestStore();
+    await expect(createTestCollection({ embedMaxBytes: 0 })).rejects.toThrow(/embedMaxBytes must be a positive integer/);
+    await cleanupTestDb(store);
+  });
+
+  test("stores created before embed rules gain the embed columns on open", async () => {
+    const store = await createTestStore();
+    const dbPath = testDbPath;
+    store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_ignore_patterns`);
+    store.db.exec(`ALTER TABLE store_collections DROP COLUMN embed_max_bytes`);
+    store.close();
+
+    const reopened = createStore(dbPath);
+    currentTestStore = reopened;
+    const cols = (reopened.db.prepare(`PRAGMA table_info(store_collections)`).all() as { name: string }[]).map(c => c.name);
+    expect(cols).toContain("embed_ignore_patterns");
+    expect(cols).toContain("embed_max_bytes");
+
+    const collectionName = await createTestCollection({ embedIgnore: ["skip/**"] });
+    await insertTestDocument(reopened.db, collectionName, { displayPath: "skip/a.md", body: "# A\n\nSkipped." });
+    expect(reopened.getHashesNeedingEmbedding()).toBe(0);
+
+    await cleanupTestDb(reopened);
+  });
+
   test("embedding health is scoped to the active embed model", async () => {
     const store = await createTestStore();
     const collectionName = await createTestCollection();
@@ -5599,6 +5662,33 @@ describe("Embedding batching", () => {
       },
     };
   }
+
+  test("generateEmbeddings skips documents matched by embed rules", async () => {
+    const store = await createTestStore();
+    const fakeLlm = createFakeEmbedLlm();
+    store.llm = fakeLlm as any;
+
+    try {
+      const collectionName = await createTestCollection({
+        embedIgnore: ["**/*.csv.md"],
+        embedMaxBytes: 200,
+      });
+      await insertTestDocument(store.db, collectionName, { displayPath: "plan.md", body: "# Plan\n\nembed-me-marker" });
+      await insertTestDocument(store.db, collectionName, { displayPath: "rows.csv.md", body: "# Rows\n\nignored-marker" });
+      await insertTestDocument(store.db, collectionName, { displayPath: "big.md", body: `# Big\n\noversized-marker ${"x".repeat(300)}` });
+
+      const result = await generateEmbeddings(store);
+
+      expect(result.docsProcessed).toBe(1);
+      const embedded = fakeLlm.embedBatchCalls.flat().join("\n");
+      expect(embedded).toContain("embed-me-marker");
+      expect(embedded).not.toContain("ignored-marker");
+      expect(embedded).not.toContain("oversized-marker");
+      expect(store.getHashesNeedingEmbedding()).toBe(0);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
 
   test("generateEmbeddings tokenizes with the store-local LLM", async () => {
     const store = await createTestStore();

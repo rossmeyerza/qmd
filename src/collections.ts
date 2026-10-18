@@ -28,6 +28,8 @@ export interface Collection {
   path: string;              // Absolute path to index
   pattern: string;           // Glob pattern (e.g., "**/*.md")
   ignore?: string[];         // Glob patterns to exclude (e.g., ["Sessions/**"])
+  embedIgnore?: string[];    // Glob patterns to index for BM25 but never embed (e.g., ["**/*.csv.md"])
+  embedMaxBytes?: number;    // Index larger documents for BM25 but never embed them
   context?: ContextMap;      // Optional context definitions
   update?: string;           // Optional bash command to run during qmd update
   includeByDefault?: boolean; // Include in queries by default (default: true)

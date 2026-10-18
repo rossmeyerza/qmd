@@ -1322,9 +1322,12 @@ function initializeDatabase(db: Database): void {
       ignore_patterns TEXT,
       include_by_default INTEGER DEFAULT 1,
       update_command TEXT,
-      context TEXT
+      context TEXT,
+      embed_ignore_patterns TEXT,
+      embed_max_bytes INTEGER
     )
   `);
+  ensureStoreCollectionsEmbedColumns(db);
 
   // Store config — key-value metadata (e.g. config_hash for sync optimization)
   db.exec(`
@@ -1374,7 +1377,33 @@ type StoreCollectionRow = {
   include_by_default: number;
   update_command: string | null;
   context: string | null;
+  embed_ignore_patterns?: string | null;
+  embed_max_bytes?: number | null;
 };
+
+const STORE_COLLECTION_EMBED_COLUMNS = [
+  { name: "embed_ignore_patterns", definition: "TEXT" },
+  { name: "embed_max_bytes", definition: "INTEGER" },
+] as const;
+
+/**
+ * Stores created before the embed rules have no embed_* columns. Add them in
+ * place; CREATE TABLE IF NOT EXISTS leaves an existing table unchanged.
+ */
+function ensureStoreCollectionsEmbedColumns(db: Database): void {
+  const cols = db.prepare(`PRAGMA table_info(store_collections)`).all() as { name?: string }[];
+  const present = new Set(cols.map(col => col.name));
+  for (const column of STORE_COLLECTION_EMBED_COLUMNS) {
+    if (present.has(column.name)) continue;
+    try {
+      db.exec(`ALTER TABLE store_collections ADD COLUMN ${column.name} ${column.definition}`);
+    } catch (error) {
+      // Another process may have added the column between the probe and the ALTER.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("duplicate column name")) throw error;
+    }
+  }
+}
 
 function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
   return {
@@ -1382,10 +1411,17 @@ function rowToNamedCollection(row: StoreCollectionRow): NamedCollection {
     path: row.path,
     pattern: row.pattern,
     ...(row.ignore_patterns ? { ignore: JSON.parse(row.ignore_patterns) as string[] } : {}),
+    ...(row.embed_ignore_patterns ? { embedIgnore: JSON.parse(row.embed_ignore_patterns) as string[] } : {}),
+    ...(row.embed_max_bytes != null ? { embedMaxBytes: row.embed_max_bytes } : {}),
     ...(row.include_by_default === 0 ? { includeByDefault: false } : {}),
     ...(row.update_command ? { update: row.update_command } : {}),
     ...(row.context ? { context: JSON.parse(row.context) as ContextMap } : {}),
   };
+}
+
+function validateEmbedMaxBytes(collectionName: string, value: number | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  return validatePositiveIntegerOption(`collections.${collectionName}.embedMaxBytes`, value, 0);
 }
 
 export function getStoreCollections(db: Database): NamedCollection[] {
@@ -1427,16 +1463,19 @@ export function getStoreContexts(db: Database): Array<{ collection: string; path
 }
 
 export function upsertStoreCollection(db: Database, name: string, collection: Omit<Collection, 'pattern'> & { pattern?: string }): void {
+  ensureStoreCollectionsEmbedColumns(db);
   db.prepare(`
-    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO store_collections (name, path, pattern, ignore_patterns, include_by_default, update_command, context, embed_ignore_patterns, embed_max_bytes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       path = excluded.path,
       pattern = excluded.pattern,
       ignore_patterns = excluded.ignore_patterns,
       include_by_default = excluded.include_by_default,
       update_command = excluded.update_command,
-      context = excluded.context
+      context = excluded.context,
+      embed_ignore_patterns = excluded.embed_ignore_patterns,
+      embed_max_bytes = excluded.embed_max_bytes
   `).run(
     name,
     collection.path,
@@ -1445,6 +1484,8 @@ export function upsertStoreCollection(db: Database, name: string, collection: Om
     collection.includeByDefault === false ? 0 : 1,
     collection.update || null,
     collection.context ? JSON.stringify(collection.context) : null,
+    collection.embedIgnore?.length ? JSON.stringify(collection.embedIgnore) : null,
+    validateEmbedMaxBytes(name, collection.embedMaxBytes),
   );
 }
 
@@ -2240,7 +2281,115 @@ function withLazyContentVectorMigration<T>(db: Database, operation: () => T): T 
   }
 }
 
+type EmbedSkipRule = {
+  isIgnored: ((path: string) => boolean) | null;
+  maxBytes: number | null;
+};
+
+/**
+ * Per-collection rules that keep documents in the BM25 index but out of the
+ * vector index. Returns null when no collection has a rule, so callers keep
+ * the single aggregate query.
+ */
+function getEmbedSkipRules(db: Database): Map<string, EmbedSkipRule> | null {
+  const rules = new Map<string, EmbedSkipRule>();
+  for (const coll of getStoreCollections(db)) {
+    const patterns = coll.embedIgnore ?? [];
+    const maxBytes = coll.embedMaxBytes ?? null;
+    if (patterns.length === 0 && maxBytes === null) continue;
+    rules.set(coll.name, {
+      isIgnored: patterns.length > 0 ? picomatch(patterns, { dot: true }) : null,
+      maxBytes,
+    });
+  }
+  return rules.size > 0 ? rules : null;
+}
+
+function isEmbeddable(rules: Map<string, EmbedSkipRule>, collection: string, path: string, bytes: number): boolean {
+  const rule = rules.get(collection);
+  if (!rule) return true;
+  if (rule.maxBytes !== null && bytes > rule.maxBytes) return false;
+  if (rule.isIgnored && rule.isIgnored(path)) return false;
+  return true;
+}
+
+type PendingEmbeddingDocRow = PendingEmbeddingDoc & { collection: string };
+
+const octetLengthSupport = new WeakMap<Database, boolean>();
+
+/**
+ * Byte length of content.doc. octet_length() (SQLite 3.43+) reads the length
+ * from the record header; length(CAST(doc AS BLOB)) loads the whole body.
+ * Documents skipped by embed rules stay pending, so the rules path measures
+ * them on every status check and must not load their bodies.
+ */
+function contentBytesExpr(db: Database): string {
+  let supported = octetLengthSupport.get(db);
+  if (supported === undefined) {
+    try {
+      db.prepare(`SELECT octet_length('a')`).get();
+      supported = true;
+    } catch {
+      supported = false;
+    }
+    octetLengthSupport.set(db, supported);
+  }
+  return supported ? `octet_length(c.doc)` : `length(CAST(c.doc AS BLOB))`;
+}
+
+/**
+ * One row per active document (not per hash) so each path can be checked
+ * against its collection's embed rules. A hash is pending when at least one
+ * of its documents may be embedded; identical content elsewhere still needs
+ * the vectors.
+ */
+function getPendingEmbeddingDocsWithRules(
+  db: Database,
+  rules: Map<string, EmbedSkipRule>,
+  collection: string | undefined,
+  model: string,
+): PendingEmbeddingDoc[] {
+  const collectionFilter = collection ? `AND d.collection = ?` : ``;
+  const fingerprint = getEmbeddingFingerprint(model);
+  return withLazyContentVectorMigration(db, () => {
+    const stmt = db.prepare(`
+      SELECT d.hash, d.collection, d.path, ${contentBytesExpr(db)} as bytes
+      FROM documents d
+      JOIN content c ON d.hash = c.hash
+      LEFT JOIN (
+        SELECT hash, model, COUNT(*) AS chunk_count, MAX(total_chunks) AS expected_chunks
+        FROM content_vectors
+        WHERE model = ? AND embed_fingerprint = ?
+        GROUP BY hash, model, embed_fingerprint
+      ) v ON d.hash = v.hash
+      WHERE d.active = 1
+        AND (v.hash IS NULL OR v.chunk_count < v.expected_chunks)
+        ${collectionFilter}
+    `);
+    const byHash = new Map<string, PendingEmbeddingDoc & { embeddable: boolean }>();
+    const iter = collection
+      ? stmt.iterate(model, fingerprint, collection)
+      : stmt.iterate(model, fingerprint);
+    for (const row of iter as IterableIterator<PendingEmbeddingDocRow>) {
+      const embeddable = isEmbeddable(rules, row.collection, row.path, row.bytes);
+      const seen = byHash.get(row.hash);
+      if (!seen) {
+        byHash.set(row.hash, { hash: row.hash, path: row.path, bytes: row.bytes, embeddable });
+        continue;
+      }
+      if (row.path < seen.path) seen.path = row.path;
+      seen.embeddable ||= embeddable;
+    }
+    return [...byHash.values()]
+      .filter(doc => doc.embeddable)
+      .map(({ hash, path, bytes }) => ({ hash, path, bytes }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  });
+}
+
 function getPendingEmbeddingDocs(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): PendingEmbeddingDoc[] {
+  const rules = getEmbedSkipRules(db);
+  if (rules) return getPendingEmbeddingDocsWithRules(db, rules, collection, model);
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {
@@ -2954,6 +3103,8 @@ export function getEmbeddingVectorSamples(db: Database, model: string, fingerpri
 }
 
 export function getHashesNeedingEmbedding(db: Database, collection?: string, model: string = DEFAULT_EMBED_MODEL): number {
+  const rules = getEmbedSkipRules(db);
+  if (rules) return getPendingEmbeddingDocsWithRules(db, rules, collection, model).length;
   const collectionFilter = collection ? `AND d.collection = ?` : ``;
   const fingerprint = getEmbeddingFingerprint(model);
   return withLazyContentVectorMigration(db, () => {

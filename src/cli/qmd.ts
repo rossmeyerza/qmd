@@ -1838,6 +1838,13 @@ function collectionList(): void {
     if (yamlColl?.ignore?.length) {
       console.log(`  ${c.dim}Ignore:${c.reset}   ${yamlColl.ignore.join(', ')}`);
     }
+    const embedSkips = [
+      ...(yamlColl?.embedIgnore ?? []),
+      ...(yamlColl?.embedMaxBytes != null ? [`> ${formatBytes(yamlColl.embedMaxBytes)}`] : []),
+    ];
+    if (embedSkips.length) {
+      console.log(`  ${c.dim}No embed:${c.reset} ${embedSkips.join(', ')}`);
+    }
     console.log(`  ${c.dim}Files:${c.reset}    ${coll.active_count}`);
     const metadataOverview = metadataOverviews.get(coll.name);
     if (metadataOverview) {
